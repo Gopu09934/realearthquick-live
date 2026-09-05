@@ -117,7 +117,7 @@ jobs:
             -f lavfi -i "sine=f=82.41:r=48000" \
             -f lavfi -i "anoisesrc=colour=pink:amplitude=0.02:sample_rate=48000" \
             -filter_complex "\
-              [1:a]volume=0.05,tremolo=f=0.08:d=0.3[a1]; \
+              [1:a]volume=0.05,tremolo=f=0.15:d=0.3[a1]; \
               [2:a]volume=0.035[a2]; \
               [3:a]volume=0.015[a3]; \
               [a1][a2][a3]amix=inputs=3:duration=longest:normalize=0[aout]; \
