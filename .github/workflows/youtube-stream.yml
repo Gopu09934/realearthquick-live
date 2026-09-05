@@ -1,0 +1,130 @@
+name: Stream Earthquake Globe to YouTube
+
+on:
+  workflow_dispatch:      # lets you start it manually from the Actions tab
+  schedule:
+    - cron: '0 */5 * * *' # re-launch every 5h, safely under GitHub's 6h job cap
+
+# Only one stream job at a time — a new scheduled run cancels a stale one
+# instead of two ffmpeg processes fighting over the same YouTube stream key.
+concurrency:
+  group: eq-youtube-stream
+  cancel-in-progress: true
+
+jobs:
+  stream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340   # ~5h40m, comfortably inside the 6h hosted-runner limit
+    # This image already has Chromium + every OS dependency it needs baked in,
+    # so the job never has to run `playwright install --with-deps` again —
+    # that download was almost all of your 5m51s. Only ffmpeg/xvfb (small, fast
+    # apt packages) and `npm install` (no browser download, versions already
+    # match) run per-job now.
+    container:
+      image: mcr.microsoft.com/playwright:v1.47.0-jammy
+      options: --ipc=host   # Chrome recommendation — avoids OOM crashes in containers
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg + Xvfb + python3
+        run: apt-get update && apt-get install -y ffmpeg xvfb python3
+
+      - name: Install JS deps (browsers already baked into the image)
+        working-directory: stream
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: npm install
+
+      - name: Serve the dashboard file
+        run: |
+          nohup python3 -m http.server 8080 > server.log 2>&1 &
+          sleep 2
+
+      - name: Start virtual display + browser
+        working-directory: stream
+        run: |
+          # 1280x720 instead of 1920x1080: this box renders WebGL in software
+          # (SwiftShader — there's no GPU on a hosted runner), so pixel count
+          # drives CPU cost almost linearly. Capturing at 720p and letting
+          # ffmpeg upscale to 1080p for YouTube cuts the browser's per-frame
+          # work by more than half, which is what actually buys smoothness —
+          # the visual softening from the upscale is invisible on a stylized
+          # ambient globe stream at this bitrate.
+          Xvfb :99 -screen 0 1280x720x24 -ac &
+          sleep 2
+          export DISPLAY=:99
+
+          CHROME_BIN=$(node print-chrome-path.js)
+          echo "Chrome binary: $CHROME_BIN"
+
+          # Launched as a plain process (not via Playwright's launch()) so
+          # there's no CDP/remote-debugging layer fighting with --kiosk.
+          # --app opens a chrome-less window on top of --kiosk's fullscreen,
+          # belt-and-suspenders against any address bar/tab strip showing up.
+          # ?stream=1 tells the page to drop into its lighter render path
+          # (no AA, smaller textures/geometry, capped to 30fps) — see
+          # earthquake-dashboard.html.
+          nohup "$CHROME_BIN" \
+            --kiosk \
+            --app="http://localhost:8080/earthquake-dashboard.html?stream=1" \
+            --window-position=0,0 \
+            --window-size=1280,720 \
+            --start-fullscreen \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-infobars \
+            --disable-session-crashed-bubble \
+            --disable-features=TranslateUI \
+            --autoplay-policy=no-user-gesture-required \
+            --use-gl=angle \
+            --use-angle=swiftshader-webgl \
+            --ignore-gpu-blocklist \
+            --enable-webgl \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --noerrdialogs \
+            --user-data-dir=/tmp/chrome-profile \
+            > browser.log 2>&1 &
+          sleep 10
+          cat browser.log || true
+
+      - name: Stream to YouTube
+        env:
+          YOUTUBE_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
+          DISPLAY: ':99'
+        run: |
+          if [ -z "$YOUTUBE_STREAM_KEY" ]; then
+            echo "ERROR: YOUTUBE_STREAM_KEY secret is not set. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          # Audio: three quiet lavfi sources mixed into a low ambient drone
+          # (two sub-bass sine tones + a whisper of pink noise) instead of
+          # anullsrc dead silence. Nothing external to license, just tone
+          # generators — keeps the stream from reading as "broken" to anyone
+          # who taps in with sound on, without competing with the visuals.
+          # -thread_queue_size gives x11grab enough buffer that a momentary
+          # scheduling hiccup on the shared runner doesn't drop a grab.
+          # -preset veryfast (down from fast) frees CPU back to the browser
+          # so the two processes stop fighting for the same 2 cores — that
+          # contention, more than anything about the rotation code itself,
+          # is what was showing up as choppy animation.
+          # scale=1920:1080 upconverts the 720p capture to a standard 1080p
+          # delivery size for YouTube; flags=lanczos keeps it clean.
+          ffmpeg -hide_banner -loglevel info \
+            -thread_queue_size 1024 \
+            -f x11grab -draw_mouse 0 -video_size 1280x720 -framerate 30 -i "$DISPLAY" \
+            -f lavfi -i "sine=f=55:r=48000" \
+            -f lavfi -i "sine=f=82.41:r=48000" \
+            -f lavfi -i "anoisesrc=colour=pink:amplitude=0.02:sample_rate=48000" \
+            -filter_complex "\
+              [1:a]volume=0.05,tremolo=f=0.08:d=0.3[a1]; \
+              [2:a]volume=0.035[a2]; \
+              [3:a]volume=0.015[a3]; \
+              [a1][a2][a3]amix=inputs=3:duration=longest:normalize=0[aout]; \
+              [0:v]scale=1920:1080:flags=lanczos,fps=30[vout]" \
+            -map "[vout]" -map "[aout]" \
+            -c:v libx264 -preset veryfast -tune zerolatency -x264-params "aq-mode=2" \
+            -b:v 6000k -maxrate 6000k -bufsize 12000k \
+            -g 60 -keyint_min 60 -sc_threshold 0 -pix_fmt yuv420p \
+            -c:a aac -b:a 128k -ar 48000 -ac 2 \
+            -f flv "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
