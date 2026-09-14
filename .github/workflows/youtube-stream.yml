@@ -40,18 +40,23 @@ jobs:
           nohup python3 -m http.server 8080 > server.log 2>&1 &
           sleep 2
 
-      - name: Start virtual display + browser
+      - name: Prepare browser launch script
         working-directory: stream
         run: |
-          # 1280x720 instead of 1920x1080: this box renders WebGL in software
-          # (SwiftShader — there's no GPU on a hosted runner), so pixel count
-          # drives CPU cost almost linearly. Capturing at 720p and letting
-          # ffmpeg upscale to 1080p for YouTube cuts the browser's per-frame
-          # work by more than half, which is what actually buys smoothness —
-          # the visual softening from the upscale is invisible on a stylized
-          # ambient globe stream at this bitrate.
-          Xvfb :99 -screen 0 1280x720x24 -ac &
-          sleep 2
+          # Pulled out into its own script (rather than inline in the next
+          # step) so the retry loop in "Stream to YouTube" can call the
+          # exact same launch sequence again later if Chrome dies mid-stream,
+          # without duplicating the flags in two places.
+          cat > /tmp/launch-browser.sh << 'EOS'
+          #!/usr/bin/env bash
+          set -e
+          cd "$GITHUB_WORKSPACE/stream"
+
+          # Xvfb may already be running on a relaunch — only start it once.
+          if ! pgrep -f "Xvfb :99" > /dev/null; then
+            Xvfb :99 -screen 0 1280x720x24 -ac &
+            sleep 2
+          fi
           export DISPLAY=:99
 
           CHROME_BIN=$(node print-chrome-path.js)
@@ -64,6 +69,7 @@ jobs:
           # ?stream=1 tells the page to drop into its lighter render path
           # (no AA, smaller textures/geometry, capped to 30fps) — see
           # earthquake-dashboard.html.
+          rm -rf /tmp/chrome-profile
           nohup "$CHROME_BIN" \
             --kiosk \
             --app="http://localhost:8080/earthquake-dashboard.html?stream=1" \
@@ -84,9 +90,14 @@ jobs:
             --disable-dev-shm-usage \
             --noerrdialogs \
             --user-data-dir=/tmp/chrome-profile \
-            > browser.log 2>&1 &
+            > /tmp/browser.log 2>&1 &
           sleep 10
-          cat browser.log || true
+          cat /tmp/browser.log || true
+          EOS
+          chmod +x /tmp/launch-browser.sh
+
+      - name: Start virtual display + browser
+        run: /tmp/launch-browser.sh
 
       - name: Stream to YouTube
         env:
@@ -97,34 +108,68 @@ jobs:
             echo "ERROR: YOUTUBE_STREAM_KEY secret is not set. Add it under Settings > Secrets and variables > Actions."
             exit 1
           fi
-          # Audio: three quiet lavfi sources mixed into a low ambient drone
-          # (two sub-bass sine tones + a whisper of pink noise) instead of
-          # anullsrc dead silence. Nothing external to license, just tone
-          # generators — keeps the stream from reading as "broken" to anyone
-          # who taps in with sound on, without competing with the visuals.
-          # -thread_queue_size gives x11grab enough buffer that a momentary
-          # scheduling hiccup on the shared runner doesn't drop a grab.
-          # -preset veryfast (down from fast) frees CPU back to the browser
-          # so the two processes stop fighting for the same 2 cores — that
-          # contention, more than anything about the rotation code itself,
-          # is what was showing up as choppy animation.
-          # scale=1920:1080 upconverts the 720p capture to a standard 1080p
-          # delivery size for YouTube; flags=lanczos keeps it clean.
-          ffmpeg -hide_banner -loglevel info \
-            -thread_queue_size 1024 \
-            -f x11grab -draw_mouse 0 -video_size 1280x720 -framerate 30 -i "$DISPLAY" \
-            -f lavfi -i "sine=f=55:r=48000" \
-            -f lavfi -i "sine=f=82.41:r=48000" \
-            -f lavfi -i "anoisesrc=colour=pink:amplitude=0.02:sample_rate=48000" \
-            -filter_complex "\
-              [1:a]volume=0.05,tremolo=f=0.15:d=0.3[a1]; \
-              [2:a]volume=0.035[a2]; \
-              [3:a]volume=0.015[a3]; \
-              [a1][a2][a3]amix=inputs=3:duration=longest:normalize=0[aout]; \
-              [0:v]scale=1920:1080:flags=lanczos,fps=30[vout]" \
-            -map "[vout]" -map "[aout]" \
-            -c:v libx264 -preset veryfast -tune zerolatency -x264-params "aq-mode=2" \
-            -b:v 6000k -maxrate 6000k -bufsize 12000k \
-            -g 60 -keyint_min 60 -sc_threshold 0 -pix_fmt yuv420p \
-            -c:a aac -b:a 128k -ar 48000 -ac 2 \
-            -f flv "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
+
+          # --- Self-healing loop -------------------------------------------
+          # ffmpeg (or the browser feeding it) can die mid-stream — a YouTube
+          # ingest hiccup, Chrome crashing under SwiftShader, a transient x11
+          # error. Previously any of those would end the whole job and leave
+          # the stream dark for up to 5h until the next cron tick. Now: on
+          # exit, check whether Chrome is still alive; relaunch it if not,
+          # then just restart ffmpeg. Capped at 50 restarts with a short
+          # backoff so a genuinely broken config fails the job (and shows up
+          # in the Actions log / watchdog) instead of looping silently
+          # forever and burning the whole timeout on empty retries.
+          MAX_RESTARTS=50
+          attempt=0
+
+          while [ "$attempt" -lt "$MAX_RESTARTS" ]; do
+            attempt=$((attempt + 1))
+            echo "=== ffmpeg attempt $attempt/$MAX_RESTARTS ==="
+
+            if ! pgrep -f "\-\-kiosk" > /dev/null; then
+              echo "Chrome isn't running — relaunching browser before starting ffmpeg."
+              /tmp/launch-browser.sh
+            fi
+
+            # Audio: three quiet lavfi sources mixed into a low ambient drone
+            # (two sub-bass sine tones + a whisper of pink noise) instead of
+            # anullsrc dead silence. Nothing external to license, just tone
+            # generators — keeps the stream from reading as "broken" to anyone
+            # who taps in with sound on, without competing with the visuals.
+            # -thread_queue_size gives x11grab enough buffer that a momentary
+            # scheduling hiccup on the shared runner doesn't drop a grab.
+            # -preset veryfast (down from fast) frees CPU back to the browser
+            # so the two processes stop fighting for the same 2 cores — that
+            # contention, more than anything about the rotation code itself,
+            # is what was showing up as choppy animation.
+            # scale=1920:1080 upconverts the 720p capture to a standard 1080p
+            # delivery size for YouTube; flags=lanczos keeps it clean.
+            set +e
+            ffmpeg -hide_banner -loglevel info \
+              -thread_queue_size 1024 \
+              -f x11grab -draw_mouse 0 -video_size 1280x720 -framerate 30 -i "$DISPLAY" \
+              -f lavfi -i "sine=f=55:r=48000" \
+              -f lavfi -i "sine=f=82.41:r=48000" \
+              -f lavfi -i "anoisesrc=colour=pink:amplitude=0.02:sample_rate=48000" \
+              -filter_complex "\
+                [1:a]volume=0.05,tremolo=f=0.15:d=0.3[a1]; \
+                [2:a]volume=0.035[a2]; \
+                [3:a]volume=0.015[a3]; \
+                [a1][a2][a3]amix=inputs=3:duration=longest:normalize=0[aout]; \
+                [0:v]scale=1920:1080:flags=lanczos,fps=30[vout]" \
+              -map "[vout]" -map "[aout]" \
+              -c:v libx264 -preset veryfast -tune zerolatency -x264-params "aq-mode=2" \
+              -b:v 6000k -maxrate 6000k -bufsize 12000k \
+              -g 60 -keyint_min 60 -sc_threshold 0 -pix_fmt yuv420p \
+              -c:a aac -b:a 128k -ar 48000 -ac 2 \
+              -f flv "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
+            code=$?
+            set -e
+
+            echo "ffmpeg exited with code $code."
+            echo "Backing off 5s before restart attempt $((attempt + 1))..."
+            sleep 5
+          done
+
+          echo "ERROR: ffmpeg failed $MAX_RESTARTS times in a row — giving up so the job reports failure."
+          exit 1
