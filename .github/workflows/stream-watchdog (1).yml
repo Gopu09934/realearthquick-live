@@ -1,0 +1,68 @@
+name: Earthquake Globe Stream Watchdog
+
+# The stream job (stream.yml) already re-launches itself every 5h and
+# self-heals ffmpeg crashes internally — but if the *job itself* fails
+# outright (setup error, container pull failure, hits its timeout, gets
+# cancelled, etc.), nothing restarts it until the next 5h cron tick.
+#
+# This workflow checks every 10 minutes whether a stream run is currently
+# queued or in progress. If not, it dispatches a fresh run immediately —
+# that's the actual "restart on failure / restart if nothing is running"
+# behavior.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/10 * * * *'
+
+permissions:
+  actions: write   # needed to list/dispatch runs of the stream workflow
+  contents: read
+
+concurrency:
+  group: eq-youtube-watchdog
+  cancel-in-progress: true
+
+jobs:
+  check-and-restart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for an active stream run, restart if none
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          REPO="${{ github.repository }}"
+          WORKFLOW="stream.yml"   # <-- must match the stream workflow's filename
+
+          # Anything currently queued or in progress?
+          ACTIVE=$(gh run list \
+            --repo "$REPO" \
+            --workflow "$WORKFLOW" \
+            --json status \
+            --jq '[.[] | select(.status == "in_progress" or .status == "queued")] | length')
+
+          echo "Active runs: $ACTIVE"
+
+          if [ "$ACTIVE" -gt 0 ]; then
+            echo "Stream is already running (or about to). Nothing to do."
+            exit 0
+          fi
+
+          # Nothing active — log the last run's outcome for context, then restart.
+          LAST_JSON=$(gh run list \
+            --repo "$REPO" \
+            --workflow "$WORKFLOW" \
+            --limit 1 \
+            --json status,conclusion,createdAt,url \
+            --jq '.[0] // empty')
+
+          if [ -z "$LAST_JSON" ]; then
+            echo "No previous runs found — starting the stream for the first time."
+          else
+            echo "Last run: $LAST_JSON"
+            echo "No active run found (it likely failed, was cancelled, or hit its timeout). Restarting."
+          fi
+
+          gh workflow run "$WORKFLOW" --repo "$REPO"
+          echo "Dispatched a new run of $WORKFLOW."
