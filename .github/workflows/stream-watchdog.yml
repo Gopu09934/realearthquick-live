@@ -13,7 +13,7 @@ name: Earthquake Globe Stream Watchdog
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/10 * * * *'
+   # - cron: '*/10 * * * *'
 
 permissions:
   actions: write   # needed to list/dispatch runs of the stream workflow
