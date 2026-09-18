@@ -99,13 +99,21 @@ jobs:
       - name: Start virtual display + browser
         run: /tmp/launch-browser.sh
 
-      - name: Stream to YouTube
+      - name: Stream to YouTube (horizontal + vertical dual stream)
         env:
           YOUTUBE_STREAM_KEY: ${{ secrets.YOUTUBE_STREAM_KEY }}
+          YOUTUBE_STREAM_KEY_VERTICAL: ${{ secrets.YOUTUBE_STREAM_KEY_VERTICAL }}
           DISPLAY: ':99'
         run: |
           if [ -z "$YOUTUBE_STREAM_KEY" ]; then
             echo "ERROR: YOUTUBE_STREAM_KEY secret is not set. Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          if [ -z "$YOUTUBE_STREAM_KEY_VERTICAL" ]; then
+            echo "ERROR: YOUTUBE_STREAM_KEY_VERTICAL secret is not set."
+            echo "Get it from YouTube Studio > Create > Go live > Stream tab > Dual stream >"
+            echo "switch from 'Auto' to 'Encoder', then copy the vertical stream key."
+            echo "Add it under Settings > Secrets and variables > Actions."
             exit 1
           fi
 
@@ -138,12 +146,25 @@ jobs:
             # who taps in with sound on, without competing with the visuals.
             # -thread_queue_size gives x11grab enough buffer that a momentary
             # scheduling hiccup on the shared runner doesn't drop a grab.
-            # -preset veryfast (down from fast) frees CPU back to the browser
-            # so the two processes stop fighting for the same 2 cores — that
-            # contention, more than anything about the rotation code itself,
-            # is what was showing up as choppy animation.
-            # scale=1920:1080 upconverts the 720p capture to a standard 1080p
-            # delivery size for YouTube; flags=lanczos keeps it clean.
+            # -preset veryfast frees CPU back to the browser (and now a
+            # *second* concurrent encode — see below) so processes stop
+            # fighting for the same 2 cores.
+            #
+            # --- Dual stream (horizontal + vertical) ------------------------
+            # [0:v]split=2 duplicates the raw 1280x720 capture into two legs
+            # BEFORE any scaling:
+            #   vsrc_h -> scaled to 1920x1080, sent to the normal horizontal
+            #             stream key, unchanged from before.
+            #   vsrc_v -> center-cropped to a 405x720 (9:16) slice, then
+            #             scaled up to 1080x1920, sent to the vertical stream
+            #             key YouTube gives you under Dual stream > Encoder.
+            # crop=405:720:437:0 -> width 405 = 720*9/16 (a true 9:16 slice
+            # of the 720px-tall capture); x-offset 437 = (1280-405)/2 centers
+            # it horizontally. If the globe/UI isn't centered on your
+            # dashboard, adjust that offset.
+            # Both legs are pushed in ONE ffmpeg process as two separate
+            # -f flv outputs, sharing the same audio mix — not two processes
+            # fighting over resources.
             set +e
             ffmpeg -hide_banner -loglevel info \
               -thread_queue_size 1024 \
@@ -152,17 +173,25 @@ jobs:
               -f lavfi -i "sine=f=82.41:r=48000" \
               -f lavfi -i "anoisesrc=colour=pink:amplitude=0.02:sample_rate=48000" \
               -filter_complex "\
+                [0:v]split=2[vsrc_h][vsrc_v]; \
+                [vsrc_h]scale=1920:1080:flags=lanczos,fps=30[vout_h]; \
+                [vsrc_v]crop=405:720:437:0,scale=1080:1920:flags=lanczos,fps=30[vout_v]; \
                 [1:a]volume=0.05,tremolo=f=0.15:d=0.3[a1]; \
                 [2:a]volume=0.035[a2]; \
                 [3:a]volume=0.015[a3]; \
-                [a1][a2][a3]amix=inputs=3:duration=longest:normalize=0[aout]; \
-                [0:v]scale=1920:1080:flags=lanczos,fps=30[vout]" \
-              -map "[vout]" -map "[aout]" \
+                [a1][a2][a3]amix=inputs=3:duration=longest:normalize=0[aout]" \
+              -map "[vout_h]" -map "[aout]" \
               -c:v libx264 -preset veryfast -tune zerolatency -x264-params "aq-mode=2" \
               -b:v 6000k -maxrate 6000k -bufsize 12000k \
               -g 60 -keyint_min 60 -sc_threshold 0 -pix_fmt yuv420p \
               -c:a aac -b:a 128k -ar 48000 -ac 2 \
-              -f flv "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
+              -f flv "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}" \
+              -map "[vout_v]" -map "[aout]" \
+              -c:v libx264 -preset veryfast -tune zerolatency -x264-params "aq-mode=2" \
+              -b:v 4000k -maxrate 4000k -bufsize 8000k \
+              -g 60 -keyint_min 60 -sc_threshold 0 -pix_fmt yuv420p \
+              -c:a aac -b:a 128k -ar 48000 -ac 2 \
+              -f flv "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY_VERTICAL}"
             code=$?
             set -e
 
