@@ -146,22 +146,32 @@ jobs:
             # who taps in with sound on, without competing with the visuals.
             # -thread_queue_size gives x11grab enough buffer that a momentary
             # scheduling hiccup on the shared runner doesn't drop a grab.
-            # -preset veryfast frees CPU back to the browser (and now a
-            # *second* concurrent encode — see below) so processes stop
-            # fighting for the same 2 cores.
+            # -preset ultrafast frees as much CPU as possible back to the
+            # browser AND the second concurrent encode below — two
+            # simultaneous x264 encodes at 1080p/30fps clocked in at
+            # speed=0.7x on GitHub's 2-vCPU runners (falling behind
+            # realtime, guaranteed to buffer), so both resolution and fps
+            # were cut on top of the faster preset until real numbers say
+            # it's keeping up (watch for speed>=1.0x in the logs).
             #
             # --- Dual stream (horizontal + vertical) ------------------------
             # [0:v]split=2 duplicates the raw 1280x720 capture into two legs
             # BEFORE any scaling:
-            #   vsrc_h -> scaled to 1920x1080, sent to the normal horizontal
-            #             stream key, unchanged from before.
+            #   vsrc_h -> sent at its native 1280x720 (no upscale — that was
+            #             pure encode cost with zero real detail gain),
+            #             just capped to 24fps, to the horizontal stream key.
             #   vsrc_v -> center-cropped to a 405x720 (9:16) slice, then
-            #             scaled up to 1080x1920, sent to the vertical stream
-            #             key YouTube gives you under Dual stream > Encoder.
+            #             scaled to 720x1280 (not full 1080x1920) at 24fps,
+            #             sent to the vertical stream key YouTube gives you
+            #             under Dual stream > Encoder.
             # crop=405:720:437:0 -> width 405 = 720*9/16 (a true 9:16 slice
             # of the 720px-tall capture); x-offset 437 = (1280-405)/2 centers
             # it horizontally. If the globe/UI isn't centered on your
             # dashboard, adjust that offset.
+            # If speed is still below 1.0x after this, next levers: drop
+            # x11grab's own -framerate below 30, or drop the vertical leg
+            # entirely and rely on YouTube's Auto crop instead of an encoder
+            # feed for it.
             # Both legs are pushed in ONE ffmpeg process as two separate
             # -f flv outputs — not two processes fighting over resources.
             # A filtergraph output pad can only be -map'd into ONE output,
@@ -177,23 +187,23 @@ jobs:
               -f lavfi -i "anoisesrc=colour=pink:amplitude=0.02:sample_rate=48000" \
               -filter_complex "\
                 [0:v]split=2[vsrc_h][vsrc_v]; \
-                [vsrc_h]scale=1920:1080:flags=lanczos,fps=30[vout_h]; \
-                [vsrc_v]crop=405:720:437:0,scale=1080:1920:flags=lanczos,fps=30[vout_v]; \
+                [vsrc_h]fps=24[vout_h]; \
+                [vsrc_v]crop=405:720:437:0,scale=720:1280:flags=lanczos,fps=24[vout_v]; \
                 [1:a]volume=0.05,tremolo=f=0.15:d=0.3[a1]; \
                 [2:a]volume=0.035[a2]; \
                 [3:a]volume=0.015[a3]; \
                 [a1][a2][a3]amix=inputs=3:duration=longest:normalize=0[amixed]; \
                 [amixed]asplit=2[aout1][aout2]" \
               -map "[vout_h]" -map "[aout1]" \
-              -c:v libx264 -preset veryfast -tune zerolatency -x264-params "aq-mode=2" \
-              -b:v 6000k -maxrate 6000k -bufsize 12000k \
-              -g 60 -keyint_min 60 -sc_threshold 0 -pix_fmt yuv420p \
+              -c:v libx264 -preset ultrafast -tune zerolatency -x264-params "aq-mode=2" \
+              -b:v 4500k -maxrate 4500k -bufsize 9000k \
+              -g 48 -keyint_min 48 -sc_threshold 0 -pix_fmt yuv420p \
               -c:a aac -b:a 128k -ar 48000 -ac 2 \
               -f flv "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}" \
               -map "[vout_v]" -map "[aout2]" \
-              -c:v libx264 -preset veryfast -tune zerolatency -x264-params "aq-mode=2" \
-              -b:v 4000k -maxrate 4000k -bufsize 8000k \
-              -g 60 -keyint_min 60 -sc_threshold 0 -pix_fmt yuv420p \
+              -c:v libx264 -preset ultrafast -tune zerolatency -x264-params "aq-mode=2" \
+              -b:v 2500k -maxrate 2500k -bufsize 5000k \
+              -g 48 -keyint_min 48 -sc_threshold 0 -pix_fmt yuv420p \
               -c:a aac -b:a 128k -ar 48000 -ac 2 \
               -f flv "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY_VERTICAL}"
             code=$?
