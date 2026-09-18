@@ -54,7 +54,7 @@ jobs:
 
           # Xvfb may already be running on a relaunch — only start it once.
           if ! pgrep -f "Xvfb :99" > /dev/null; then
-            Xvfb :99 -screen 0 1280x720x24 -ac &
+            Xvfb :99 -screen 0 1920x1080x24 -ac &
             sleep 2
           fi
           export DISPLAY=:99
@@ -74,7 +74,7 @@ jobs:
             --kiosk \
             --app="http://localhost:8080/earthquake-dashboard.html?stream=1" \
             --window-position=0,0 \
-            --window-size=1280,720 \
+            --window-size=1920,1080 \
             --start-fullscreen \
             --no-first-run \
             --no-default-browser-check \
@@ -147,8 +147,11 @@ jobs:
             # so the two processes stop fighting for the same 2 cores — that
             # contention, more than anything about the rotation code itself,
             # is what was showing up as choppy animation.
-            # scale=1920:1080 upconverts the 720p capture to a standard 1080p
-            # delivery size for YouTube; flags=lanczos keeps it clean.
+            # Xvfb, the Chrome window and x11grab are all 1920x1080 now, so
+            # there is no scale filter — every pixel YouTube gets is one Chrome
+            # actually painted. The old path rendered 720p and upscaled with
+            # lanczos, which meant all the small UI text (feed timestamps,
+            # magnitude labels) was interpolated and permanently soft.
             #
             # Dual destinations: a single x264 encode is produced once, then
             # fanned out to both RTMP endpoints via the `tee` muxer. That's
@@ -161,7 +164,7 @@ jobs:
             set +e
             ffmpeg -hide_banner -loglevel info \
               -thread_queue_size 1024 \
-              -f x11grab -draw_mouse 0 -video_size 1280x720 -framerate 30 -i "$DISPLAY" \
+              -f x11grab -draw_mouse 0 -video_size 1920x1080 -framerate 30 -i "$DISPLAY" \
               -f lavfi -i "sine=f=55:r=48000" \
               -f lavfi -i "sine=f=82.41:r=48000" \
               -f lavfi -i "anoisesrc=colour=pink:amplitude=0.02:sample_rate=48000" \
@@ -170,7 +173,7 @@ jobs:
                 [2:a]volume=0.035[a2]; \
                 [3:a]volume=0.015[a3]; \
                 [a1][a2][a3]amix=inputs=3:duration=longest:normalize=0[aout]; \
-                [0:v]scale=1920:1080:flags=lanczos,fps=30[vout]" \
+                [0:v]fps=30[vout]" \
               -map "[vout]" -map "[aout]" \
               -c:v libx264 -preset veryfast -tune zerolatency -x264-params "aq-mode=2" \
               -b:v 6000k -maxrate 6000k -bufsize 12000k \
