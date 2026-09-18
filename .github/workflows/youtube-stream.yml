@@ -188,7 +188,7 @@ jobs:
               -filter_complex "\
                 [0:v]split=2[vsrc_h][vsrc_v]; \
                 [vsrc_h]fps=24[vout_h]; \
-                [vsrc_v]crop=405:720:437:0,scale=720:1280:flags=lanczos,fps=24[vout_v]; \
+                [vsrc_v]crop=405:720:437:0,scale=1280:720:flags=lanczos,fps=24[vout_v]; \
                 [1:a]volume=0.05,tremolo=f=0.15:d=0.3[a1]; \
                 [2:a]volume=0.035[a2]; \
                 [3:a]volume=0.015[a3]; \
