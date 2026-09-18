@@ -160,14 +160,17 @@ jobs:
             #   vsrc_h -> sent at its native 1280x720 (no upscale — that was
             #             pure encode cost with zero real detail gain),
             #             just capped to 24fps, to the horizontal stream key.
-            #   vsrc_v -> center-cropped to a 405x720 (9:16) slice, then
-            #             scaled to 720x1280 (not full 1080x1920) at 24fps,
+            #   vsrc_v -> full 1280x720 frame scaled down to fit a 720px
+            #             width (720x405, same 16:9 shape, nothing cut off),
+            #             then padded with black bars top and bottom up to
+            #             720x1280 so the whole dashboard stays visible —
             #             sent to the vertical stream key YouTube gives you
             #             under Dual stream > Encoder.
-            # crop=405:720:437:0 -> width 405 = 720*9/16 (a true 9:16 slice
-            # of the 720px-tall capture); x-offset 437 = (1280-405)/2 centers
-            # it horizontally. If the globe/UI isn't centered on your
-            # dashboard, adjust that offset.
+            # pad=720:1280:0:437 -> x=0 (already full width), y=437 centers
+            # the 405px-tall image vertically in the 1280px-tall canvas
+            # ((1280-405)/2 ≈ 437). If you'd rather crop-and-zoom (lose the
+            # edges but no black bars) instead of letterboxing, swap back to
+            # crop=405:720:437:0,scale=720:1280.
             # If speed is still below 1.0x after this, next levers: drop
             # x11grab's own -framerate below 30, or drop the vertical leg
             # entirely and rely on YouTube's Auto crop instead of an encoder
@@ -188,7 +191,7 @@ jobs:
               -filter_complex "\
                 [0:v]split=2[vsrc_h][vsrc_v]; \
                 [vsrc_h]fps=24[vout_h]; \
-                [vsrc_v]crop=405:720:437:0,scale=1280:720:flags=lanczos,fps=24[vout_v]; \
+                [vsrc_v]scale=720:405:flags=lanczos,pad=720:1280:0:437:color=black,fps=24[vout_v]; \
                 [1:a]volume=0.05,tremolo=f=0.15:d=0.3[a1]; \
                 [2:a]volume=0.035[a2]; \
                 [3:a]volume=0.015[a3]; \
